@@ -1,71 +1,94 @@
-import time
+"""Shared helpers for the FlexGEMM pytest suite.
+
+Correctness tests should be deterministic, fast, and scoped to a single
+setting per parametrize case. Cross-cutting helpers live here.
+"""
+
+from __future__ import annotations
+
 import torch
 
 
 @torch.no_grad()
-def sphere_coords(res, ch, device='cuda', dtype=torch.float):
+def sphere_coords(
+    res: int,
+    ch: int,
+    batch_size: int = 1,
+    device: str | torch.device = "cuda",
+    dtype: torch.dtype = torch.float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Size]:
+    """Build a thin spherical shell of voxel coords inside ``[0, res)^3``.
+
+    Returns ``(feats, coords, shape)`` in channel-last layout:
+
+    - ``coords``: ``(M, 1 + 3)`` int32 with a leading batch column.
+    - ``feats``:  ``(M, ch)`` of ``dtype``.
+    - ``shape``:  ``(batch_size, res, res, res, ch)``.
+    """
     l_coords = []
     for i in range(0, res, 256):
         for j in range(0, res, 256):
             for k in range(0, res, 256):
-                coords = torch.stack(torch.meshgrid(
-                    torch.arange(i, min(i + 256, res), device=device),
-                    torch.arange(j, min(j + 256, res), device=device),
-                    torch.arange(k, min(k + 256, res), device=device),
-                    indexing='ij'
-                ), dim=-1).int().contiguous()
-                dist = ((coords.float() - res / 2 + 0.5) ** 2).sum(dim=-1).sqrt()
+                grid = torch.stack(
+                    torch.meshgrid(
+                        torch.arange(i, min(i + 256, res), device=device),
+                        torch.arange(j, min(j + 256, res), device=device),
+                        torch.arange(k, min(k + 256, res), device=device),
+                        indexing="ij",
+                    ),
+                    dim=-1,
+                ).int().contiguous()
+                dist = ((grid.float() - res / 2 + 0.5) ** 2).sum(dim=-1).sqrt()
                 active = (dist <= res / 2) & (dist >= res / 2 - 1.25)
-                coords = torch.nonzero(active).int() + torch.tensor([i, j, k], device=device, dtype=torch.int32)
-                l_coords.append(coords)
+                pts = torch.nonzero(active).int() + torch.tensor(
+                    [i, j, k], device=device, dtype=torch.int32
+                )
+                l_coords.append(pts)
     coords = torch.cat(l_coords, dim=0)
-    coords = torch.cat([torch.zeros(coords.shape[0], 1, device=device, dtype=torch.int32), coords], dim=-1)
+    batch_idx = (
+        torch.arange(batch_size).repeat_interleave(coords.shape[0]).to(device).int()
+    )
+    coords = torch.cat(
+        [batch_idx.unsqueeze(-1), torch.cat([coords] * batch_size)], dim=-1
+    )
     feats = torch.randn(coords.shape[0], ch, device=device, dtype=dtype)
-    return feats.contiguous(), coords.contiguous(), torch.Size([1, ch, res, res, res])
+    return feats.contiguous(), coords.contiguous(), torch.Size(
+        [batch_size, res, res, res, ch]
+    )
 
 
-def calc_err(src, ref):
+def make_unique_keys(
+    n: int, dim: int, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    """Deterministic linear keys whose rows are unique modulo ``dtype`` range."""
+    base = torch.arange(n, device=device, dtype=dtype)
+    cols = [base * (97 + i * 13) + (17 + i) for i in range(dim)]
+    return torch.stack(cols, dim=1)
+
+
+def rows_as_tuples(t: torch.Tensor) -> set[tuple[int, ...]]:
+    return {tuple(row.tolist()) for row in t.cpu()}
+
+
+def calc_err(src: torch.Tensor, ref: torch.Tensor) -> tuple[float, float]:
+    """Return ``(max_err, mean_err)`` where error is the elementwise min of
+    absolute and relative error (the latter is clamped to avoid division by
+    zero). Matches the convention used in the legacy ``tests_old`` suite.
+    """
     abs_err = (src - ref).float().abs()
     rel_err = abs_err / torch.clamp_min(ref.float().abs(), 1e-6)
     err = torch.minimum(abs_err, rel_err)
     return err.max().item(), err.mean().item()
 
 
-def benchmark_kernel(kernel_fn, *args, prepare_fn=None, num_warmup=2, num_iters=20, **kwargs):
-    try:
-        if prepare_fn is not None:
-            kwargs = prepare_fn(*args, **kwargs)
-            args = tuple()
-        # Warmup iterations.
-        for _ in range(num_warmup):
-            C = kernel_fn(*args, **kwargs)
-        torch.cuda.reset_peak_memory_stats()
-        torch.cuda.synchronize()
-        # Timing iterations.
-        start = time.time()
-        for _ in range(num_iters):
-            C = kernel_fn(*args, **kwargs)
-        torch.cuda.synchronize()
-        elapsed = time.time() - start
-        memory = torch.cuda.max_memory_allocated() / 1024**3
-        avg_time_ms = (elapsed / num_iters) * 1000.0
-        avg_mem_gb = memory
-        if isinstance(C, tuple):
-            C = torch.cat([c.detach().flatten() for c in C if c is not None], dim=0)
-    except Exception as e:
-        if isinstance(e, RuntimeError) and 'out of memory' in str(e):
-            print('WARNING: OOM error occurred during benchmarking. Skipping this run.')
-            return None, 'OOM', None
-        else:
-            raise e
-    return avg_time_ms, avg_mem_gb, C
+def lexsort(keys: torch.Tensor) -> torch.Tensor:
+    """Return permutation that sorts ``keys`` (``(D, N)``) lexicographically.
 
+    Used to align outputs by coordinate when comparing sparse-conv backends
+    that produce the same set of voxels in different orders.
+    """
+    idx = torch.arange(keys.shape[1], device=keys.device)
+    for k in reversed(keys):
+        idx = idx[k[idx].argsort(stable=True)]
+    return idx
 
-def zero_grad(model_params):
-    for param in model_params:
-       if param.grad is not None:
-            if param.grad.grad_fn is not None:
-                param.grad.detach_()
-            else:
-                param.grad.requires_grad_(False)
-            param.grad.zero_()

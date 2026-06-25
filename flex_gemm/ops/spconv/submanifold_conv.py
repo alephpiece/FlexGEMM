@@ -1,555 +1,379 @@
-from typing import *
-import itertools
 import torch
 from torch import Tensor
-from torch.autograd import Function
-from .. import spconv
-from ... import config
-from ..utils import make_conv_neighbor_offsets, init_hashmap, lookup_pytorch
-from ... import kernels
+from typing import *
+import warnings
+
+from ..neighbor_cache import NeighborCache, build_neighbor_cache
+from ..utils import _broadcast_dim_arg, split_sparse_shape
+from .functions import _select_function
 
 
 __all__ = [
-    "SubMConvExplicitGemmFunction",
-    "SubMConvImplicitGemmFunction",
-    "SubMConvImplicitGemmSplitKFunction",
-    "SubMConvMaskedImplicitGemmFunction",
-    "SubMConvMaskedImplicitGemmSplitKFunction",
-    "sparse_submanifold_conv3d",
-    "sparse_submanifold_conv",
-    "sparse_submanifold_conv_any_offset",
+    'submanifold_conv',
+    'submanifold_conv2d',
+    'submanifold_conv3d',
+    'submanifold_conv4d',
+    # deprecated aliases
+    'sparse_submanifold_conv3d',
 ]
 
 
-class SubMConvNeighborCache:
-    neighbor_map: Tensor
-
-    def __init__(self, neighbor_map: Tensor):
-        self.neighbor_map = neighbor_map
-
-    def __getitem__(self, key):
-        return getattr(self, key)
-    
-    def __setitem__(self, key, value):
-        setattr(self, key, value)
-    
-    def __contains__(self, key):
-        return hasattr(self, key)
-
-    def neighbor_map_post_process_for_masked_implicit_gemm_1(self):
-        neighbor_map = self.neighbor_map
-        V = self.neighbor_map.shape[1] 
-        assert V <= 32, "Currently, the max kernel volume is 32 because kernel mask is encoded as uint32"
-
-        if config.USE_CUDA_EXTENSION:
-            gray_code, sorted_idx, valid_signal_i, valid_signal_o, valid_signal_seg = \
-                kernels.cuda.neighbor_map_post_process_for_masked_implicit_gemm_1(neighbor_map)
-        else:
-            gray_code, sorted_idx, valid_signal_i, valid_signal_o, valid_signal_seg = \
-                kernels.triton.neighbor_map_post_process_for_masked_implicit_gemm_1(neighbor_map)
-        self['gray_code'] = gray_code
-        self['sorted_idx'] = sorted_idx
-        self['valid_signal_i'] = valid_signal_i
-        self['valid_signal_o'] = valid_signal_o
-        self['valid_signal_seg'] = valid_signal_seg
-
-    def neighbor_map_post_process_for_masked_implicit_gemm_2(self, block_size: int):
-        if config.USE_CUDA_EXTENSION:
-            valid_kernel, valid_kernel_seg = kernels.cuda.neighbor_map_post_process_for_masked_implicit_gemm_2(self['gray_code'], self['sorted_idx'], block_size)
-        else:
-            valid_kernel, valid_kernel_seg = kernels.triton.neighbor_map_post_process_for_masked_implicit_gemm_2(self['gray_code'], self['sorted_idx'], block_size)
-        self[f'valid_kernel_{block_size}'] = valid_kernel
-        self[f'valid_kernel_seg_{block_size}'] = valid_kernel_seg
-    
-    def valid_kernel_callback(self, block_size: int) -> Tensor:
-        if f'valid_kernel_{block_size}' not in self or f'valid_kernel_seg_{block_size}' not in self:
-            self.neighbor_map_post_process_for_masked_implicit_gemm_2(block_size)
-        return self[f'valid_kernel_{block_size}']
-    
-    def valid_kernel_seg_callback(self, block_size: int) -> Tensor:
-        if f'valid_kernel_{block_size}' not in self or f'valid_kernel_seg_{block_size}' not in self:
-            self.neighbor_map_post_process_for_masked_implicit_gemm_2(block_size)
-        return self[f'valid_kernel_seg_{block_size}']
+_Algo = Literal[
+    "explicit_gemm", "implicit_gemm", "implicit_gemm_splitk",
+    "masked_implicit_gemm", "masked_implicit_gemm_splitk",
+]
 
 
-class SubMConvExplicitGemmFunction(Function):
-    @staticmethod
-    def forward(
-        ctx,
-        feats: Tensor,
-        neighbor_cache: SubMConvNeighborCache,
-        weight: Tensor,
-        bias: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, SubMConvNeighborCache]:
-        assert feats.is_contiguous(), "Input features should be contiguous"
-        Co, V, Ci = weight.shape
-        assert feats.shape[-1] == Ci, f"Input channels ({feats.shape[-1]}) should match weight channels ({Ci})"
-
-        neighbor_map = neighbor_cache['neighbor_map']
-        N = feats.shape[0]
-        im2col = feats.index_select(0, neighbor_map.view(-1).view(dtype=torch.int32).clamp_min(0))\
-                        .masked_fill((neighbor_map == -1).view(-1, 1), 0).view(N, V * Ci)
-
-        weight_mat = weight.view(Co, V * Ci).transpose(0, 1)
-        if bias is not None:
-            output = torch.addmm(bias, im2col, weight_mat)
-        else:
-            output = torch.mm(im2col, weight_mat)
-
-        ctx.save_for_backward(feats, weight, bias)
-        ctx.neighbor_cache = neighbor_cache
-        return output, neighbor_cache
-
-    @staticmethod
-    def backward(ctx, grad_output: Tensor, _):
-        feats, weight, bias = ctx.saved_tensors
-        neighbor_cache = ctx.neighbor_cache
-        neighbor_map = neighbor_cache['neighbor_map']
-        N = feats.shape[0]
-        Co, V, Ci = weight.shape
-
-        if feats.requires_grad:
-            im2col = torch.zeros((N * V, Co), device=feats.device, dtype=feats.dtype)
-            inv_neighbor_map = torch.flip(neighbor_map, [1])
-            mask = inv_neighbor_map.view(-1) != -1
-            im2col[mask] = grad_output[inv_neighbor_map.view(-1).long()[mask]]
-            im2col = im2col.view(N, V * Co)
-            grad_input = torch.mm(im2col, weight.view(Co, V, Ci).transpose(0, 1).reshape(V * Co, Ci))
-        else:
-            grad_input = None
-
-        if weight.requires_grad:
-            im2col = torch.zeros((N * V, Ci), device=weight.device, dtype=weight.dtype)
-            mask = neighbor_map.view(-1) != -1
-            im2col[mask] = feats[neighbor_map.view(-1).long()[mask]]
-            im2col = im2col.view(N, V * Ci)
-            grad_weight = torch.mm(im2col.t(), grad_output.view(N, -1)).view(V, Ci, Co).permute(2, 0, 1).contiguous()
-        else:
-            grad_weight = None
-
-        if bias is not None and bias.requires_grad:
-            grad_bias = grad_output.sum(dim=0)
-        else:
-            grad_bias = None
-
-        return grad_input, None, grad_weight, grad_bias, None
-
-
-class SubMConvImplicitGemmFunction(Function):
-    @staticmethod
-    def forward(
-        ctx,
-        feats: Tensor,
-        neighbor_cache: SubMConvNeighborCache,
-        weight: Tensor,
-        bias: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, SubMConvNeighborCache]:
-        assert feats.is_contiguous(), "Input features should be contiguous"
-        Co, V, Ci = weight.shape
-        assert feats.shape[-1] == Ci, f"Input channels ({feats.shape[-1]}) should match weight channels ({Ci})"
-
-        output = kernels.triton.sparse_submanifold_conv_fwd_implicit_gemm(
-            feats,
-            weight,
-            bias,
-            neighbor_cache['neighbor_map']
-        )
-
-        ctx.save_for_backward(feats, weight, bias)
-        ctx.neighbor_cache = neighbor_cache
-        return output, neighbor_cache
-
-    @staticmethod
-    def backward(ctx, grad_output: Tensor, _):
-        feats, weight, bias = ctx.saved_tensors
-        neighbor_cache = ctx.neighbor_cache
-
-        grad_input, grad_weight, grad_bias = kernels.triton.sparse_submanifold_conv_bwd_implicit_gemm(
-            grad_output.contiguous(),
-            feats,
-            weight,
-            bias,
-            neighbor_cache['neighbor_map']
-        )
-
-        if not feats.requires_grad:
-            grad_input = None
-        if not weight.requires_grad:
-            grad_weight = None
-        if not bias.requires_grad:
-            grad_bias = None
-        return grad_input, None, grad_weight, grad_bias, None
-
-
-class SubMConvImplicitGemmSplitKFunction(Function):
-    @staticmethod
-    def forward(
-        ctx,
-        feats: Tensor,
-        neighbor_cache: SubMConvNeighborCache,
-        weight: Tensor,
-        bias: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, SubMConvNeighborCache]:
-        assert feats.is_contiguous(), "Input features should be contiguous"
-        Co, V, Ci = weight.shape
-        assert feats.shape[-1] == Ci, f"Input channels ({feats.shape[-1]}) should match weight channels ({Ci})"
-
-        output = kernels.triton.sparse_submanifold_conv_fwd_implicit_gemm_splitk(
-            feats,
-            weight,
-            bias,
-            neighbor_cache['neighbor_map']
-        )
-
-        ctx.save_for_backward(feats, weight, bias)
-        ctx.neighbor_cache = neighbor_cache
-        return output, neighbor_cache
-
-    @staticmethod
-    def backward(ctx, grad_output: Tensor, _):
-        feats, weight, bias = ctx.saved_tensors
-        neighbor_cache = ctx.neighbor_cache
-
-        grad_input, grad_weight, grad_bias = kernels.triton.sparse_submanifold_conv_bwd_implicit_gemm_splitk(
-            grad_output.contiguous(),
-            feats,
-            weight,
-            bias,
-            neighbor_cache['neighbor_map']
-        )
-
-        if not feats.requires_grad:
-            grad_input = None
-        if not weight.requires_grad:
-            grad_weight = None
-        if not bias.requires_grad:
-            grad_bias = None
-        return grad_input, None, grad_weight, grad_bias, None
-
-
-class SubMConvMaskedImplicitGemmFunction(Function):
-    @staticmethod
-    def forward(
-        ctx,
-        feats: Tensor,
-        neighbor_cache: SubMConvNeighborCache,
-        weight: Tensor,
-        bias: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, SubMConvNeighborCache]:
-        assert feats.is_contiguous(), "Input features should be contiguous"
-        Co, V, Ci = weight.shape
-        assert feats.shape[-1] == Ci, f"Input channels ({feats.shape[-1]}) should match weight channels ({Ci})"
-
-        neighbor_cache.neighbor_map_post_process_for_masked_implicit_gemm_1()
-
-        output = kernels.triton.sparse_submanifold_conv_fwd_masked_implicit_gemm(
-            feats,
-            weight,
-            bias,
-            neighbor_cache['neighbor_map'],
-            neighbor_cache['sorted_idx'],
-            neighbor_cache.valid_kernel_callback,
-            neighbor_cache.valid_kernel_seg_callback
-        )
-
-        ctx.save_for_backward(feats, weight, bias)
-        ctx.neighbor_cache = neighbor_cache
-        return output, neighbor_cache
-
-    @staticmethod
-    def backward(ctx, grad_output: Tensor, _):
-        feats, weight, bias = ctx.saved_tensors
-        neighbor_cache = ctx.neighbor_cache
-
-        grad_input, grad_weight, grad_bias = kernels.triton.sparse_submanifold_conv_bwd_masked_implicit_gemm(
-            grad_output.contiguous(),
-            feats,
-            weight,
-            bias,
-            neighbor_cache['neighbor_map'],
-            neighbor_cache['sorted_idx'],
-            neighbor_cache['valid_kernel_callback'],
-            neighbor_cache['valid_kernel_seg_callback'],
-            neighbor_cache['valid_signal_i'],
-            neighbor_cache['valid_signal_o'],
-            neighbor_cache['valid_signal_seg']
-        )
-
-        if not feats.requires_grad:
-            grad_input = None
-        if not weight.requires_grad:
-            grad_weight = None
-        if not bias.requires_grad:
-            grad_bias = None
-        return grad_input, None, grad_weight, grad_bias, None
-
-
-class SubMConvMaskedImplicitGemmSplitKFunction(Function):
-    @staticmethod
-    def forward(
-        ctx,
-        feats: Tensor,
-        neighbor_cache: SubMConvNeighborCache,
-        weight: Tensor,
-        bias: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, SubMConvNeighborCache]:
-        assert feats.is_contiguous(), "Input features should be contiguous"
-        Co, V, Ci = weight.shape
-        assert feats.shape[-1] == Ci, f"Input channels ({feats.shape[-1]}) should match weight channels ({Ci})"
-
-        neighbor_cache.neighbor_map_post_process_for_masked_implicit_gemm_1()
-
-        output = kernels.triton.sparse_submanifold_conv_fwd_masked_implicit_gemm_splitk(
-            feats,
-            weight,
-            bias,
-            neighbor_cache['neighbor_map'],
-            neighbor_cache['sorted_idx'],
-            neighbor_cache.valid_kernel_callback,
-            neighbor_cache.valid_kernel_seg_callback
-        )
-
-        ctx.save_for_backward(feats, weight, bias)
-        ctx.neighbor_cache = neighbor_cache
-        return output, neighbor_cache
-
-    @staticmethod
-    def backward(ctx, grad_output: Tensor, _):
-        feats, weight, bias = ctx.saved_tensors
-        neighbor_cache = ctx.neighbor_cache
-
-        grad_input, grad_weight, grad_bias = kernels.triton.sparse_submanifold_conv_bwd_masked_implicit_gemm_splitk(
-            grad_output.contiguous(),
-            feats,
-            weight,
-            bias,
-            neighbor_cache['neighbor_map'],
-            neighbor_cache['sorted_idx'],
-            neighbor_cache['valid_kernel_callback'],
-            neighbor_cache['valid_kernel_seg_callback'],
-            neighbor_cache['valid_signal_i'],
-            neighbor_cache['valid_signal_o'],
-            neighbor_cache['valid_signal_seg']
-        )
-
-        if not feats.requires_grad:
-            grad_input = None
-        if not weight.requires_grad:
-            grad_weight = None
-        if not bias.requires_grad:
-            grad_bias = None
-        return grad_input, None, grad_weight, grad_bias, None
-
-
-def _compute_neighbor_cache_any_offset(
-    coords: Tensor,
-    offsets: Tensor,
-) -> SubMConvNeighborCache:
-    coords = coords.contiguous()
-    offsets = offsets.contiguous()
-
-    if offsets.shape[1] < coords.shape[1]:
-        # add batch dims to neighbor offsets if not already included
-        batch_dims = coords.shape[1] - offsets.shape[1]
-        offsets = torch.cat([
-            torch.zeros((offsets.shape[0], batch_dims), dtype=offsets.dtype, device=offsets.device),
-            offsets
-        ], dim=1)
-
-    # Compute neighbor map
-    if config._USE_PYTORCH_FOR_TEST:
-        neighbor_coords = coords[:, None, :] + offsets[None, :, :]          # [N, V, 4]
-        neighbor_map = lookup_pytorch(coords, neighbor_coords).to(torch.int32)
-    else:
-        neighbor_map = kernels.triton.build_neighbor_map_from_offsets_triton(
-            coords,
-            offsets,
-        )
-        
-    return SubMConvNeighborCache(neighbor_map)
-
-
-def _compute_neighbor_cache_kernel_dilation(
-    coords: Tensor,
-    shape: Optional[torch.Size],
-    kernel_size: tuple[int, ...],
-    dilation: tuple[int, ...]
-) -> SubMConvNeighborCache:
-    assert coords.is_contiguous(), "Coords should be contiguous"
-    assert len(kernel_size) == len(dilation), "Kernel size and dilation should have the same length"
-
-    # CUDA extension is specially optimized for 3D convolution with int32 coords.
-    use_cuda_extension = config.USE_CUDA_EXTENSION \
-        and coords.shape[1] == 4 \
-        and coords.dtype == torch.int32 \
-        and shape is not None \
-        and kernel_size == (3, 3, 3)
-
-    if config._USE_PYTORCH_FOR_TEST:
-        # Debug only
-        offsets = make_conv_neighbor_offsets(kernel_size, dilation, batch_dims=coords.shape[1] - len(kernel_size), dtype=torch.int32, device=coords.device)
-        neighbor_coords = coords[:, None, :] + offsets[None, :, :]          # [N, V, D]
-        neighbor_map = lookup_pytorch(coords, neighbor_coords).to(torch.int32)
-
-    elif use_cuda_extension:
-        # Use the CUDA extension if possible
-        N, C, W, H, D = shape
-        hashmap_keys, hashmap_vals = init_hashmap(shape, int(spconv.HASHMAP_RATIO * coords.shape[0]), coords.device)
-        neighbor_map = kernels.cuda.hashmap_build_submanifold_conv_neighbour_map_cuda(
-            hashmap_keys, hashmap_vals, coords,
-            W, H, D,
-            kernel_size[0], kernel_size[1], kernel_size[2],
-            dilation[0], dilation[1], dilation[2],
-        )
-
-    else:
-        # Triton kernels for neighbor map construction. 
-        neighbor_map = kernels.triton.build_neighbor_map_from_kernel_dilation_triton(
-            coords,
-            kernel_size=kernel_size,
-            dilation=dilation,
-        )
-            
-    return SubMConvNeighborCache(neighbor_map)
-
-
-def _select_submconv_function(algorithm: Literal["explicit_gemm", "implicit_gemm", "implicit_gemm_splitk", "masked_implicit_gemm", "masked_implicit_gemm_splitk"] | None = None) -> Type[Function]:
-    if algorithm is None:
-        # Default to the global config algorithm if not specified.
-        algorithm = spconv.ALGORITHM
-        
-    if algorithm == "explicit_gemm":
-        return SubMConvExplicitGemmFunction
-    if algorithm == "implicit_gemm":
-        return SubMConvImplicitGemmFunction
-    if algorithm == "implicit_gemm_splitk":
-        return SubMConvImplicitGemmSplitKFunction
-    if algorithm == "masked_implicit_gemm":
-        return SubMConvMaskedImplicitGemmFunction
-    if algorithm == "masked_implicit_gemm_splitk":
-        return SubMConvMaskedImplicitGemmSplitKFunction
-    raise ValueError(f"Invalid algorithm {algorithm}")
-
-
-def sparse_submanifold_conv(
+@overload
+def submanifold_conv(
     feats: Tensor,
     coords: Tensor,
-    shape: Optional[torch.Size],
+    shape: torch.Size,
     weight: Tensor,
-    bias: Optional[Tensor] = None,
-    neighbor_cache: Optional[SubMConvNeighborCache] = None,
-    dilation: int | tuple[int, int, int] = 1,
-    algorithm: Literal["explicit_gemm", "implicit_gemm", "implicit_gemm_splitk", "masked_implicit_gemm", "masked_implicit_gemm_splitk"] = None,
-) -> Tuple[Tensor, SubMConvNeighborCache]:
-    """
-    Sparse submanifold convolution.
+    bias: Tensor | None = None,
+    *,
+    dilation: tuple[int, ...] | None = None,
+    neighbor_cache: NeighborCache | None = None,
+    algorithm: _Algo = None,
+    allow_tf32: bool | None = None,
+) -> tuple[Tensor, NeighborCache]:
+    """Submanifold convolution with a dense ``(kernel_size, dilation)`` kernel.
+
+    ``kernel_size`` is inferred from ``weight.shape[1:-1]``. Output coordinates
+    coincide with input coordinates.
 
     Args:
-        feats (Tensor): [N, C] tensor of input features.
-        coords (Tensor): [N, B + D] tensor of input coordinates.
-            Each row represents a coordinate, where the first B dimensions are batch indices, and the last D dimensions are spatial coordinates.
-        shape (Optional[torch.Size]): shape of the input tensor in NCWHD order. Only required when using CUDA extension.
-        weight (Tensor): [Co, K1, ..., KD, Ci] tensor of weights.
-        bias (Optional[Tensor]): [Co] tensor of biases.
-        neighbor_cache (Optional[SubMConv3dNeighborCache]): neighbor cache for forward.
-            if None, will be computed in forward.
-        dilation (Tuple[int, int, int]): dilation rate.
-        algorithm (Literal["explicit_gemm", "implicit_gemm", "implicit_gemm_splitk", "masked_implicit_gemm", "masked_implicit_gemm_splitk"]): algorithm to use for convolution.
+        feats (Tensor): ``(N, Ci)`` input features.
+        coords (Tensor): ``(N, B + Ds)`` input coordinates.
+        shape (torch.Size): input dense shape in channel-last layout ``(*batch_dims, S1, ..., SDs, C)``
+        weight (Tensor): ``(Co, K1, ..., KDs, Ci)`` convolution weights.
+        bias (Optional[Tensor]): [Co] bias.
+        dilation: tuple of length Ds. Defaults to all-1.
+        neighbor_cache: if provided, validated via
+            :meth:`NeighborCache.assert_match`.
+        algorithm: index-GEMM algorithm variant.
 
     Returns:
-        Tuple[Tensor, SubMConv3dNeighborCache]:
-            - output (Tensor): [N, Co] tensor of output features.
-            - neighbor_cache (SubMConv3dNeighborCache): neighbor cache for backward or future reuse of shared structures.
+        (output_feats, neighbor_cache).
     """
-    if isinstance(dilation, int):
-        dilation = (dilation,) * (weight.ndim - 2)
-    if neighbor_cache is None:
-        neighbor_cache = _compute_neighbor_cache_kernel_dilation(coords, shape, weight.shape[1:-1], dilation)
-    
-    SubMConvFunc = _select_submconv_function(algorithm)
-    output, neighbor_cache = SubMConvFunc.apply(feats, neighbor_cache, weight.flatten(1, -2), bias)
-    return output, neighbor_cache
+    ...
 
 
+@overload
+def submanifold_conv(
+    feats: Tensor,
+    coords: Tensor,
+    shape: torch.Size,
+    weight: Tensor,
+    bias: Tensor | None = None,
+    *,
+    kernel_delta: Tensor,
+    symmetric: bool | None = None,
+    neighbor_cache: NeighborCache | None = None,
+    algorithm: _Algo = None,
+    allow_tf32: bool | None = None,
+) -> tuple[Tensor, NeighborCache]:
+    """Submanifold convolution with an arbitrary ``kernel_delta`` kernel.
+
+    Output coordinates coincide with input coordinates.
+
+    Args:
+        feats (Tensor): ``(N, Ci)`` input features.
+        coords (Tensor): ``(N, B + Ds)`` input coordinates.
+        shape (torch.Size): input dense shape in channel-last layout ``(*batch_dims, S1, ..., SDs, C)``
+        weight (Tensor): ``(Co, V, Ci)`` convolution weights.
+        bias (Optional[Tensor]): [Co] bias.
+        kernel_delta (Tensor): ``(V, Ds)`` kernel offsets.
+        symmetric: if ``None``, auto-detected from ``kernel_delta``.
+        neighbor_cache: if provided, validated via
+            :meth:`NeighborCache.assert_match`.
+        algorithm: index-GEMM algorithm variant.
+
+    Returns:
+        (output_feats, neighbor_cache).
+    """
+    ...
+
+
+def submanifold_conv(
+    feats: Tensor,
+    coords: Tensor,
+    shape: torch.Size,
+    weight: Tensor,
+    bias: Tensor | None = None,
+    *,
+    dilation: tuple[int, ...] | None = None,
+    kernel_delta: Tensor | None = None,
+    symmetric: bool | None = None,
+    neighbor_cache: NeighborCache | None = None,
+    algorithm: _Algo = None,
+    allow_tf32: bool | None = None,
+) -> tuple[Tensor, NeighborCache]:
+    """Dispatch on (kernel parameterization). See the two overloads above."""
+    # Channel-last: cache only stores the sparse prefix of ``shape``.
+    sparse_in_shape = split_sparse_shape(shape, coords.shape[1])
+    if kernel_delta is None:
+        # kernel_size mode: weight is ``(Co, K1, ..., KDs, Ci)``; infer kernel_size.
+        kernel_size = tuple(weight.shape[1:-1])
+        dilation = tuple(dilation) if dilation is not None else (1,) * len(kernel_size)
+        assert len(dilation) == len(kernel_size), (
+            "dilation length must match the kernel's spatial dimensionality."
+        )
+
+        if neighbor_cache is None:
+            neighbor_cache = build_neighbor_cache(
+                coords,
+                submanifold=True,
+                input_sparse_shape=sparse_in_shape,
+                kernel_size=kernel_size,
+                dilation=dilation,
+            )
+        else:
+            neighbor_cache.assert_match(
+                input_coords=coords,
+                output_coords=coords,
+                is_transposed=False,
+                kernel_size=kernel_size,
+                dilation=dilation,
+            )
+        weight_v = weight.flatten(1, -2)
+    else:
+        # kernel_delta mode: weight is ``(Co, V, Ci)``; used as-is.
+        assert dilation is None, "dilation is only valid in kernel_size mode (mutually exclusive with kernel_delta)."
+        # Materialize ``symmetric`` here so both the build path and the
+        # ``assert_match`` path see the same concrete value.
+        if symmetric is None:
+            symmetric = bool(torch.equal(kernel_delta, (-kernel_delta).flip(0)))
+
+        if neighbor_cache is None:
+            neighbor_cache = build_neighbor_cache(
+                coords,
+                submanifold=True,
+                kernel_delta=kernel_delta,
+                symmetric=symmetric,
+            )
+        else:
+            neighbor_cache.assert_match(
+                input_coords=coords,
+                output_coords=coords,
+            )
+        weight_v = weight
+
+    SparseConvFunc = _select_function(algorithm)
+    output_feats, neighbor_cache = SparseConvFunc.apply(
+        feats, neighbor_cache, weight_v, bias, allow_tf32,
+    )
+    return output_feats, neighbor_cache
+
+
+# ---------------------------------------------------------------------------
+# Fixed-spatial-dim aliases.
+#
+# Compared with :func:`submanifold_conv`, dim-related arguments (``dilation``)
+# accept either a scalar ``int`` (broadcast to length ``D``) or a length-``D``
+# sequence. ``coords.shape[1]`` may exceed ``D``; the leading
+# ``coords.shape[1] - D`` columns are treated as batch dims.
+#
+# ``@overload`` declarations don't transfer through ``functools.wraps`` (they
+# live in ``typing._overload_registry`` per fully-qualified name), so we
+# re-declare both overloads (kernel_size mode / kernel_delta mode) per alias.
+# ---------------------------------------------------------------------------
+
+
+def _submanifold_conv_nd(
+    D: int, feats, coords, shape, weight, bias,
+    dilation, kernel_delta, symmetric, neighbor_cache, algorithm, allow_tf32,
+):
+    dilation = _broadcast_dim_arg(dilation, D, "dilation")
+    return submanifold_conv(
+        feats, coords, shape, weight, bias,
+        dilation=dilation, kernel_delta=kernel_delta, symmetric=symmetric,
+        neighbor_cache=neighbor_cache, algorithm=algorithm,
+        allow_tf32=allow_tf32,
+    )
+
+
+# --- 2-D ---------------------------------------------------------------------
+@overload
+def submanifold_conv2d(
+    feats: Tensor,
+    coords: Tensor,
+    shape: torch.Size,
+    weight: Tensor,
+    bias: Tensor | None = None,
+    *,
+    dilation: int | tuple[int, int] | None = None,
+    neighbor_cache: NeighborCache | None = None,
+    algorithm: _Algo = None,
+) -> tuple[Tensor, NeighborCache]:
+    """2-D spatial alias of :func:`submanifold_conv` (kernel_size mode).
+
+    ``dilation`` may be a scalar ``int`` (broadcast to length 2) or a
+    length-2 tuple. ``coords.shape[1]`` may exceed 2; the leading columns are
+    batch dims. All other args/semantics match :func:`submanifold_conv`.
+    """
+    ...
+@overload
+def submanifold_conv2d(
+    feats: Tensor,
+    coords: Tensor,
+    shape: torch.Size,
+    weight: Tensor,
+    bias: Tensor | None = None,
+    *,
+    kernel_delta: Tensor,
+    symmetric: bool | None = None,
+    neighbor_cache: NeighborCache | None = None,
+    algorithm: _Algo = None,
+) -> tuple[Tensor, NeighborCache]:
+    """2-D spatial alias of :func:`submanifold_conv` (kernel_delta mode).
+
+    ``coords.shape[1]`` may exceed 2; the leading columns are batch dims.
+    All other args/semantics match :func:`submanifold_conv`.
+    """
+    ...
+def submanifold_conv2d(
+    feats, coords, shape, weight, bias=None, *,
+    dilation=None, kernel_delta=None, symmetric=None,
+    neighbor_cache=None, algorithm=None, allow_tf32=None,
+):
+    return _submanifold_conv_nd(
+        2, feats, coords, shape, weight, bias,
+        dilation, kernel_delta, symmetric, neighbor_cache, algorithm, allow_tf32,
+    )
+
+
+# --- 3-D ---------------------------------------------------------------------
+@overload
+def submanifold_conv3d(
+    feats: Tensor,
+    coords: Tensor,
+    shape: torch.Size,
+    weight: Tensor,
+    bias: Tensor | None = None,
+    *,
+    dilation: int | tuple[int, int, int] | None = None,
+    neighbor_cache: NeighborCache | None = None,
+    algorithm: _Algo = None,
+) -> tuple[Tensor, NeighborCache]:
+    """3-D spatial alias of :func:`submanifold_conv` (kernel_size mode).
+
+    ``dilation`` may be a scalar ``int`` (broadcast to length 3) or a
+    length-3 tuple. ``coords.shape[1]`` may exceed 3; the leading columns are
+    batch dims. All other args/semantics match :func:`submanifold_conv`.
+    """
+    ...
+@overload
+def submanifold_conv3d(
+    feats: Tensor,
+    coords: Tensor,
+    shape: torch.Size,
+    weight: Tensor,
+    bias: Tensor | None = None,
+    *,
+    kernel_delta: Tensor,
+    symmetric: bool | None = None,
+    neighbor_cache: NeighborCache | None = None,
+    algorithm: _Algo = None,
+) -> tuple[Tensor, NeighborCache]:
+    """3-D spatial alias of :func:`submanifold_conv` (kernel_delta mode).
+
+    ``coords.shape[1]`` may exceed 3; the leading columns are batch dims.
+    All other args/semantics match :func:`submanifold_conv`.
+    """
+    ...
+def submanifold_conv3d(
+    feats, coords, shape, weight, bias=None, *,
+    dilation=None, kernel_delta=None, symmetric=None,
+    neighbor_cache=None, algorithm=None, allow_tf32=None,
+):
+    return _submanifold_conv_nd(
+        3, feats, coords, shape, weight, bias,
+        dilation, kernel_delta, symmetric, neighbor_cache, algorithm, allow_tf32,
+    )
+
+
+# --- 4-D ---------------------------------------------------------------------
+@overload
+def submanifold_conv4d(
+    feats: Tensor,
+    coords: Tensor,
+    shape: torch.Size,
+    weight: Tensor,
+    bias: Tensor | None = None,
+    *,
+    dilation: int | tuple[int, int, int, int] | None = None,
+    neighbor_cache: NeighborCache | None = None,
+    algorithm: _Algo = None,
+) -> tuple[Tensor, NeighborCache]:
+    """4-D spatial alias of :func:`submanifold_conv` (kernel_size mode).
+
+    ``dilation`` may be a scalar ``int`` (broadcast to length 4) or a
+    length-4 tuple. ``coords.shape[1]`` may exceed 4; the leading columns are
+    batch dims. All other args/semantics match :func:`submanifold_conv`.
+    """
+    ...
+@overload
+def submanifold_conv4d(
+    feats: Tensor,
+    coords: Tensor,
+    shape: torch.Size,
+    weight: Tensor,
+    bias: Tensor | None = None,
+    *,
+    kernel_delta: Tensor,
+    symmetric: bool | None = None,
+    neighbor_cache: NeighborCache | None = None,
+    algorithm: _Algo = None,
+) -> tuple[Tensor, NeighborCache]:
+    """4-D spatial alias of :func:`submanifold_conv` (kernel_delta mode).
+
+    ``coords.shape[1]`` may exceed 4; the leading columns are batch dims.
+    All other args/semantics match :func:`submanifold_conv`.
+    """
+    ...
+def submanifold_conv4d(
+    feats, coords, shape, weight, bias=None, *,
+    dilation=None, kernel_delta=None, symmetric=None,
+    neighbor_cache=None, algorithm=None, allow_tf32=None,
+):
+    return _submanifold_conv_nd(
+        4, feats, coords, shape, weight, bias,
+        dilation, kernel_delta, symmetric, neighbor_cache, algorithm, allow_tf32,
+    )
+
+
+@overload
 def sparse_submanifold_conv3d(
     feats: Tensor,
     coords: Tensor,
     shape: torch.Size,
     weight: Tensor,
-    bias: Optional[Tensor] = None,
-    neighbor_cache: Optional[SubMConvNeighborCache] = None,
-    dilation: int | tuple[int, int, int] = (1, 1, 1),
-    algorithm: Literal["explicit_gemm", "implicit_gemm", "implicit_gemm_splitk", "masked_implicit_gemm", "masked_implicit_gemm_splitk"] = None,
-) -> tuple[Tensor, SubMConvNeighborCache]:
+    bias: Tensor | None = None,
+    neighbor_cache: NeighborCache | None = None,
+    dilation: int | tuple[int, int, int] | None = None,
+    algorithm: _Algo = None,
+) -> tuple[Tensor, NeighborCache]:
+    """(deprecated)
+    v1.0 compatible 3-D spatial alias of :func:`submanifold_conv` (kernel_size mode).
+
+    ``dilation`` may be a scalar ``int`` (broadcast to length 3) or a
+    length-3 tuple. ``coords.shape[1]`` may exceed 3; the leading columns are
+    batch dims. All other args/semantics match :func:`submanifold_conv`.
     """
-    Sparse submanifold convolution for 3D input.
-
-    Args:
-        feats (Tensor): [N, C] tensor of input features.
-        coords (Tensor): [N, 4] tensor of input coordinates.
-        shape (torch.Size): shape of the input tensor in NCWHD order.
-        weight (Tensor): [Co, Kw, Kh, Kd, Ci] tensor of weights.
-        bias (Optional[Tensor]): [Co] tensor of biases.
-        neighbor_cache (Optional[SubMConv3dNeighborCache]): neighbor cache for forward.
-            if None, will be computed in forward.
-        dilation (Tuple[int, int, int]): dilation rate.
-        algorithm (Literal["explicit_gemm", "implicit_gemm", "implicit_gemm_splitk", "masked_implicit_gemm", "masked_implicit_gemm_splitk"]): algorithm to use for convolution.
-
-    Returns:
-        Tuple[Tensor, SubMConv3dNeighborCache]:
-            - output (Tensor): [N, Co] tensor of output features.
-            - neighbor_cache (SubMConv3dNeighborCache): neighbor cache for backward or future reuse of shared structures.
-    """
-    assert coords.shape[1] == 4, "Coords should have 4 dimensions (batch + 3 spatial dims)"
-    assert weight.ndim == 5, "Weight should have 5 dimensions (Co, Kw, Kh, Kd, Ci)"
-
-    return sparse_submanifold_conv(
-        feats=feats,
-        coords=coords,
-        shape=shape,
-        weight=weight,
-        bias=bias,
-        neighbor_cache=neighbor_cache,
-        dilation=dilation,
-        algorithm=algorithm
+    ...
+def sparse_submanifold_conv3d(
+    feats, coords, shape, weight, bias=None, neighbor_cache=None,
+    dilation=None, algorithm=None, allow_tf32=None,
+):
+    warnings.warn(
+        "sparse_submanifold_conv3d will be deprecated in a future version. " \
+        "Use submanifold_conv3d or submanifold_conv instead.", 
+        DeprecationWarning, 
+        stacklevel=2
     )
-
-
-def sparse_submanifold_conv_any_offset(
-    feats: Tensor,
-    coords: Tensor,
-    offsets: Tensor,
-    weight: Tensor,
-    bias: Optional[Tensor] = None,
-    neighbor_cache: Optional[SubMConvNeighborCache] = None,
-    algorithm: Literal["explicit_gemm", "implicit_gemm", "implicit_gemm_splitk", "masked_implicit_gemm", "masked_implicit_gemm_splitk"] = None,
-) -> Tuple[Tensor, SubMConvNeighborCache]:
-    """
-    Sparse submanifold convolution function with general kernel offsets.
-
-    Args:
-        feats (Tensor): [N, C] tensor of input features.
-        coords (Tensor): [N, B + D] tensor of input coordinates.
-            Each row represents a coordinate, where the first B dimensions are batch indices, and the last D dimensions are spatial coordinates.
-        offsets (Tensor): [V, D] tensor of kernel offsets.
-            V is the kernel volume, and D is the spatial dimension.
-        weight (Tensor): [Co, V, Ci] tensor of weights.
-        bias (Optional[Tensor]): [Co] tensor of biases.
-        neighbor_cache (Optional[SubMConvNeighborCache]): neighbor cache for forward.
-            if None, will be computed in forward.
-        algorithm (Literal["explicit_gemm", "implicit_gemm", "implicit_gemm_splitk", "masked_implicit_gemm", "masked_implicit_gemm_splitk"]): algorithm to use for convolution.
-
-    Returns:
-        Tuple[Tensor, SubMConvNeighborCache]:
-            - output (Tensor): [N, Co] tensor of output features.
-            - neighbor_cache (SubMConvNeighborCache): neighbor cache for backward or future reuse of shared structures.
-    """
-    # A current limitation: the gemm backward relies on the symmetry of neighbors.
-    assert torch.equal(offsets, (-offsets).flip(0)), "Offsets must be symmetric."
-
-    if neighbor_cache is None:
-        neighbor_cache = _compute_neighbor_cache_any_offset(coords, offsets)
-    
-    SubMConvFunc = _select_submconv_function(algorithm)
-    output, neighbor_cache = SubMConvFunc.apply(feats, neighbor_cache, weight, bias)
-    return output, neighbor_cache
+    return _submanifold_conv_nd(
+        3, feats, coords, shape, weight, bias,
+        dilation=dilation, kernel_delta=None, symmetric=None, 
+        neighbor_cache=neighbor_cache, algorithm=algorithm, allow_tf32=allow_tf32, 
+    )

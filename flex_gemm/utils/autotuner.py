@@ -32,6 +32,18 @@ class TritonPersistentCacheAutotuner(triton.runtime.Autotuner):
         use_cuda_graph=False,
         do_bench=None,
     ):
+        super_kwargs = {
+            "pre_hook": pre_hook,
+            "post_hook": post_hook,
+            "prune_configs_by": prune_configs_by,
+            "use_cuda_graph": use_cuda_graph,
+        }
+        if warmup is not None:
+            super_kwargs["warmup"] = warmup
+        if rep is not None:
+            super_kwargs["rep"] = rep
+        if "do_bench" in inspect.signature(triton.runtime.Autotuner.__init__).parameters:
+            super_kwargs["do_bench"] = do_bench
         super().__init__(
             fn,
             arg_names,
@@ -39,13 +51,7 @@ class TritonPersistentCacheAutotuner(triton.runtime.Autotuner):
             key,
             reset_to_zero,
             restore_value,
-            pre_hook,
-            post_hook,
-            prune_configs_by,
-            warmup,
-            rep,
-            use_cuda_graph,
-            do_bench,
+            **super_kwargs,
         )
 
     def run(self, *args, **kwargs):

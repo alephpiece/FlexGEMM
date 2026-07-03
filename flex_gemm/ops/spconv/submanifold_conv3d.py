@@ -232,9 +232,9 @@ class SubMConv3dFunction(Function):
             if feats.requires_grad:
                 # im2col
                 im2col = torch.zeros((N * V, Co), device=feats.device, dtype=feats.dtype)
-                inv_neighbor_map = torch.flip(neighbor_map, [1])
+                inv_neighbor_map = torch.flip(neighbor_map.to(torch.long), [1])
                 mask = inv_neighbor_map.view(-1) != 0xffffffff
-                im2col[mask] = grad_output[inv_neighbor_map.view(-1).long()[mask]]
+                im2col[mask] = grad_output[inv_neighbor_map.view(-1)[mask]]
                 im2col = im2col.view(N, V * Co)
                 
                 # addmm

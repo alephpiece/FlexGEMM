@@ -1,6 +1,6 @@
 import torch
 import triton
-from ..utils import get_autotune_config
+from ..utils import config_signature, get_autotune_config
 
 
 allow_tf32 = not torch.version.hip
@@ -81,3 +81,26 @@ autotune_config = get_autotune_config(
         ],
     }
 )
+
+
+_gfx936_dweight_splitk_autotune_config = [
+    triton.Config({'B1': 128, 'B2': 128, 'BK': 32, 'waves_per_eu': 2}, num_warps=8, num_stages=1),
+    triton.Config({'B1': 128, 'B2': 128, 'BK': 16, 'waves_per_eu': 2}, num_warps=8, num_stages=1),
+    triton.Config({'B1': 128, 'B2': 64,  'BK': 32, 'waves_per_eu': 2}, num_warps=4, num_stages=1),
+    triton.Config({'B1': 64,  'B2': 128, 'BK': 32, 'waves_per_eu': 2}, num_warps=4, num_stages=1),
+    triton.Config({'B1': 64,  'B2': 64,  'BK': 32, 'waves_per_eu': 2}, num_warps=4, num_stages=1),
+    triton.Config({'B1': 64,  'B2': 64,  'BK': 32, 'waves_per_eu': 2}, num_warps=4, num_stages=2),
+    triton.Config({'B1': 64,  'B2': 32,  'BK': 32, 'waves_per_eu': 2}, num_warps=4, num_stages=1),
+    triton.Config({'B1': 32,  'B2': 64,  'BK': 32, 'waves_per_eu': 2}, num_warps=4, num_stages=1),
+    triton.Config({'B1': 32,  'B2': 32,  'BK': 32, 'waves_per_eu': 2}, num_warps=4, num_stages=1),
+    triton.Config({'B1': 32,  'B2': 32,  'BK': 32, 'waves_per_eu': 2}, num_warps=4, num_stages=2),
+]
+
+
+subm_dweight_splitk_autotune_config = get_autotune_config(
+    default=autotune_config,
+    arch={
+        'gfx936': _gfx936_dweight_splitk_autotune_config,
+    }
+)
+subm_dweight_splitk_config_signature = config_signature(subm_dweight_splitk_autotune_config)

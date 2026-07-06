@@ -10,7 +10,7 @@ from .sparse_submanifold_conv_fwd_masked_implicit_gemm import sparse_submanifold
 
 
 @triton_autotune(
-    configs=config.autotune_config,
+    configs=config.subm_fwd_dinput_autotune_config,
     key=['LOGN', 'Ci', 'Co', 'V', 'SPLITK', 'allow_tf32'],
 )
 @triton.heuristics({

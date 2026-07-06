@@ -13,7 +13,7 @@ from .sparse_submanifold_conv_bwd_masked_implicit_gemm import (
 
 
 @triton_autotune(
-    configs=config.autotune_config,
+    configs=config.subm_fwd_dinput_autotune_config,
     key=['LOGN', 'Ci', 'Co', 'V', 'SPLITK', 'allow_tf32'],
 )
 @triton.heuristics({
@@ -102,7 +102,7 @@ def sparse_submanifold_conv_bwd_input_masked_implicit_gemm_splitk_kernel(
     
 @triton_autotune(
     configs=config.subm_dweight_splitk_autotune_config,
-    key=['LOGN', 'Ci', 'Co', 'V', 'SPLITK', 'allow_tf32', 'DWEIGHT_CONFIG_SIGNATURE'],
+    key=['LOGN', 'Ci', 'Co', 'V', 'SPLITK', 'allow_tf32'],
 )
 @triton.jit
 def sparse_submanifold_conv_bwd_weight_masked_implicit_gemm_splitk_kernel(
@@ -120,7 +120,6 @@ def sparse_submanifold_conv_bwd_weight_masked_implicit_gemm_splitk_kernel(
     BK: tl.constexpr,   # Block size for K dimension (N)
     SPLITK: tl.constexpr,  # Split K dimension
     allow_tf32: tl.constexpr,  # Allow TF32 precision for matmuls
-    DWEIGHT_CONFIG_SIGNATURE: tl.constexpr,  # Autotune key signature for dweight config policy
 ):
     """
     Sparse submanifold convolution backward to weight kernel using implicit GEMM.
@@ -314,7 +313,6 @@ def sparse_submanifold_conv_bwd_weight_masked_implicit_gemm_splitk(
             N, LOGN, Ci, Co, V,
             SPLITK=SPLITK,
             allow_tf32=config.allow_tf32,
-            DWEIGHT_CONFIG_SIGNATURE=config.subm_dweight_splitk_config_signature,
         )
         return grad_weight.sum(0).to(input.dtype)
 

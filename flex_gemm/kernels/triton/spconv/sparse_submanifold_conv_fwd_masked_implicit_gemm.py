@@ -8,7 +8,7 @@ from . import config
 
 
 @triton_autotune(
-    configs=config.autotune_config,
+    configs=config.subm_fwd_dinput_autotune_config,
     key=['LOGN', 'Ci', 'Co', 'V', 'allow_tf32'],
 )
 @triton.heuristics({

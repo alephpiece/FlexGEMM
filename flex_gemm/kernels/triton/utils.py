@@ -1,6 +1,4 @@
 from typing import *
-import hashlib
-import json
 import torch
 import triton
 
@@ -37,26 +35,6 @@ def get_platform_name():
 def get_num_sm():
     return torch.cuda.get_device_properties("cuda").multi_processor_count
 
-
-def _json_value(value):
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    return repr(value)
-
-
-def config_signature(configs: List[triton.Config]) -> int:
-    payload = []
-    for cfg in configs:
-        kwargs = getattr(cfg, 'kwargs', {})
-        payload.append({
-            'kwargs': sorted((str(key), _json_value(value)) for key, value in kwargs.items()),
-            'num_warps': getattr(cfg, 'num_warps', None),
-            'num_stages': getattr(cfg, 'num_stages', None),
-        })
-    payload.sort(key=lambda elem: json.dumps(elem, sort_keys=True))
-    encoded = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()
-    return int.from_bytes(hashlib.blake2s(encoded, digest_size=4).digest(), 'big')
-    
 
 def get_autotune_config(
     default: List[triton.Config] = None,

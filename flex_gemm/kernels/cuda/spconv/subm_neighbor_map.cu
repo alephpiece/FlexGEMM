@@ -1,6 +1,8 @@
 #include <torch/extension.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 
 #include "subm_neighbor_map.h"
 #include "../hash/api.h"
@@ -109,6 +111,8 @@ torch::Tensor hashmap_build_submanifold_conv_neighbour_map(
     int Kw, int Kh, int Kd,
     int Dw, int Dh, int Dd
 ) {
+    c10::cuda::CUDAGuard device_guard(coords.device());
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
     // Allocate output tensor
     int V = Kw * Kh * Kd;
 
@@ -125,7 +129,7 @@ torch::Tensor hashmap_build_submanifold_conv_neighbour_map(
     if (hashmap_keys.dtype() == torch::kUInt32) {
         hashmap_lookup_submanifold_conv_neighbour_map_kernel<<<
             (coords.size(0) * (V / 2 + 1) + BLOCK_SIZE - 1) / BLOCK_SIZE,
-            BLOCK_SIZE
+            BLOCK_SIZE, 0, stream
         >>>(
             hashmap_keys.size(0),
             coords.size(0),
@@ -141,7 +145,7 @@ torch::Tensor hashmap_build_submanifold_conv_neighbour_map(
     else if (hashmap_keys.dtype() == torch::kUInt64) {
         hashmap_lookup_submanifold_conv_neighbour_map_kernel<<<
             (coords.size(0) * (V / 2 + 1) + BLOCK_SIZE - 1) / BLOCK_SIZE,
-            BLOCK_SIZE
+            BLOCK_SIZE, 0, stream
         >>>(
             hashmap_keys.size(0),
             coords.size(0),

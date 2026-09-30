@@ -1,6 +1,8 @@
 #include <torch/extension.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 
 #include "migemm_neighmap_pp.h"
 #include "../hash/api.h"
@@ -58,6 +60,8 @@ __global__ void neighbor_map_to_gray_binary_code_kernel(
 std::tuple<torch::Tensor, torch::Tensor> neighbor_map_post_process_for_masked_implicit_gemm_1_no_bwd(
     const torch::Tensor& neighbor_map
 ) {
+    c10::cuda::CUDAGuard device_guard(neighbor_map.device());
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
     const int64_t N = neighbor_map.size(0);
     const int64_t V = neighbor_map.size(1);
 
@@ -67,7 +71,7 @@ std::tuple<torch::Tensor, torch::Tensor> neighbor_map_post_process_for_masked_im
 
     // Convert neighbor map to gray and binary code
     neighbor_map_to_gray_binary_code_kernel<<<
-        (N + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE
+        (N + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream
     >>>(
         N,
         V,
@@ -194,6 +198,8 @@ __global__ void gather_idx_val_seg_from_prefix_sum_kernel(
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> neighbor_map_post_process_for_masked_implicit_gemm_1(
     const torch::Tensor& neighbor_map
 ) {
+    c10::cuda::CUDAGuard device_guard(neighbor_map.device());
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
     const int64_t N = neighbor_map.size(0);
     const int64_t V = neighbor_map.size(1);
 
@@ -207,7 +213,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     neighbor_map_to_gray_binary_code_and_T_map_kernel<<<
         (N + BLOCK_SIZE - 1) / BLOCK_SIZE,
         BLOCK_SIZE,
-        BLOCK_SIZE * V * sizeof(uint32_t)
+        BLOCK_SIZE * V * sizeof(uint32_t),
+        stream
     >>>(
         N,
         V,
@@ -228,7 +235,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     auto valid_signal_seg = torch::empty({V + 1}, torch::dtype(torch::kUInt32).device(neighbor_map.device()));
     gather_idx_val_seg_from_prefix_sum_kernel<<<
         (N * V + BLOCK_SIZE - 1) / BLOCK_SIZE,
-        BLOCK_SIZE
+        BLOCK_SIZE, 0, stream
     >>>(
         N,
         V,
@@ -332,6 +339,8 @@ std::tuple<torch::Tensor, torch::Tensor> neighbor_map_post_process_for_masked_im
     const torch::Tensor& sorted_idx,
     int block_size
 ) {
+    c10::cuda::CUDAGuard device_guard(gray_code.device());
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
     const uint32_t N = gray_code.size(0);
     
     // Reduce gray code to reduced code and segment length
@@ -340,7 +349,7 @@ std::tuple<torch::Tensor, torch::Tensor> neighbor_map_post_process_for_masked_im
     auto seglen = torch::empty({num_blocks + 1}, torch::dtype(torch::kInt32).device(gray_code.device()));
     reduce_code_kernel<<<
         (N + BLOCK_SIZE - 1) / BLOCK_SIZE,
-        BLOCK_SIZE
+        BLOCK_SIZE, 0, stream
     >>>(
         N,
         block_size,
@@ -356,7 +365,7 @@ std::tuple<torch::Tensor, torch::Tensor> neighbor_map_post_process_for_masked_im
     auto valid_kernel_idx = torch::empty({seglen[-1].item<int32_t>()}, torch::dtype(torch::kInt32).device(gray_code.device()));
     scatter_reduced_code_kernel<<<
         (num_blocks + BLOCK_SIZE - 1) / BLOCK_SIZE,
-        BLOCK_SIZE
+        BLOCK_SIZE, 0, stream
     >>>(
         num_blocks,
         reduced_code.data_ptr<int32_t>(),

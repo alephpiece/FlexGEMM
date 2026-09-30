@@ -1,6 +1,8 @@
 #include <torch/extension.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 
 #include "api.h"
 #include "hash.cuh"
@@ -396,11 +398,12 @@ static void dispatch_hashmap_insert_3d_idx_as_val(
     torch::Tensor& hashmap_keys,
     torch::Tensor& hashmap_values,
     const torch::Tensor& coords,
-    int W, int H, int D
+    int W, int H, int D,
+    cudaStream_t stream
 ) {
     hashmap_insert_3d_idx_as_val_kernel<<<
         (coords.size(0) + BLOCK_SIZE - 1) / BLOCK_SIZE,
-        BLOCK_SIZE
+        BLOCK_SIZE, 0, stream
     >>>(
         hashmap_keys.size(0),
         coords.size(0),
@@ -430,18 +433,20 @@ void hashmap_insert_3d_idx_as_val(
     int H,
     int D
 ) {
+    c10::cuda::CUDAGuard device_guard(coords.device());
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
     // Dispatch to 32-bit or 64-bit kernel
     if (hashmap_keys.dtype() == torch::kUInt32 && hashmap_values.dtype() == torch::kUInt32) {
-        dispatch_hashmap_insert_3d_idx_as_val<uint32_t, uint32_t>(hashmap_keys, hashmap_values, coords, W, H, D);
+        dispatch_hashmap_insert_3d_idx_as_val<uint32_t, uint32_t>(hashmap_keys, hashmap_values, coords, W, H, D, stream);
     }
     else if (hashmap_keys.dtype() == torch::kUInt32 && hashmap_values.dtype() == torch::kUInt64) {
-        dispatch_hashmap_insert_3d_idx_as_val<uint32_t, uint64_t>(hashmap_keys, hashmap_values, coords, W, H, D);
+        dispatch_hashmap_insert_3d_idx_as_val<uint32_t, uint64_t>(hashmap_keys, hashmap_values, coords, W, H, D, stream);
     }
     else if (hashmap_keys.dtype() == torch::kUInt64 && hashmap_values.dtype() == torch::kUInt32) {
-        dispatch_hashmap_insert_3d_idx_as_val<uint64_t, uint32_t>(hashmap_keys, hashmap_values, coords, W, H, D);
+        dispatch_hashmap_insert_3d_idx_as_val<uint64_t, uint32_t>(hashmap_keys, hashmap_values, coords, W, H, D, stream);
     }
     else if (hashmap_keys.dtype() == torch::kUInt64 && hashmap_values.dtype() == torch::kUInt64) {
-        dispatch_hashmap_insert_3d_idx_as_val<uint64_t, uint64_t>(hashmap_keys, hashmap_values, coords, W, H, D);
+        dispatch_hashmap_insert_3d_idx_as_val<uint64_t, uint64_t>(hashmap_keys, hashmap_values, coords, W, H, D, stream);
     }
     else {
         TORCH_CHECK(false, "Unsupported data type");
